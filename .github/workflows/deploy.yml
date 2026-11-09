@@ -1,0 +1,47 @@
+name: Deploy
+
+# Deploys main to the production VPS after CI passes. Protect the "production" environment
+# with required reviewers in GitHub settings so every deploy is approved by a human.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          RELEASE: ${{ github.event.workflow_run.head_sha || github.sha }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          fingerprint: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
+          envs: RELEASE
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /opt/black-mamba
+            git fetch --quiet origin main
+            git checkout --quiet --detach "$RELEASE"
+            export RELEASE
+            compose="docker compose -f docker-compose.prod.yml --env-file .env.production"
+            $compose build --pull
+            $compose up -d --wait --remove-orphans
+            $compose exec -T api blackmamba verify-all
+            docker image prune -f >/dev/null
+            echo "deployed $RELEASE"

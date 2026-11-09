@@ -1,0 +1,160 @@
+# BLACK MAMBA — local development stack.
+#   cp .env.example .env   (then edit secrets)
+#   docker compose up -d --build
+# Web: http://localhost:3000 · API: http://localhost:8000/docs · MinIO console: http://localhost:9001
+# Service hostnames below override the localhost URLs in .env (those are for running outside Docker).
+
+name: black-mamba
+
+x-api-build: &api-build
+  context: ./apps/api
+  dockerfile: ../../infrastructure/docker/api/Dockerfile
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-blackmamba}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-blackmamba}
+  REDIS_URL: redis://redis:6379/0
+  S3_ENDPOINT_URL: http://minio:9000
+  STORAGE_BACKEND: s3
+  RATE_LIMIT_BACKEND: redis
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:-blackmamba}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-blackmamba}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-blackmamba}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Creates <db>_test for `uv run pytest` against this container.
+      - ./infrastructure/docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    build:
+      context: ./infrastructure/docker/minio
+    image: black-mamba-minio:dev
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-blackmamba}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      # Single static key for SSE in dev (NFR-1). Use a real KMS in production.
+      MINIO_KMS_SECRET_KEY: ${MINIO_KMS_SECRET_KEY:?set MINIO_KMS_SECRET_KEY in .env}
+    ports:
+      - "127.0.0.1:9000:9000" # S3 API
+      - "127.0.0.1:9001:9001" # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: create the evidence bucket, enforce server-side encryption, block public access.
+  minio-init:
+    build:
+      context: ./infrastructure/docker/minio
+    image: black-mamba-minio:dev
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-blackmamba}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-evidence}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/$${S3_BUCKET} &&
+      mc encrypt set sse-s3 local/$${S3_BUCKET} &&
+      mc anonymous set none local/$${S3_BUCKET}
+      "
+    restart: "no"
+
+  api:
+    build:
+      <<: *api-build
+      target: api
+    image: black-mamba-api:dev
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *backend-env
+      FORWARDED_ALLOW_IPS: "*" # only reachable from localhost and the web container
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # URL archiver (FR-4): RQ worker with Playwright Chromium. Outbound HTTP only; no ports.
+  worker:
+    build:
+      <<: *api-build
+      target: worker
+    image: black-mamba-worker:dev
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *backend-env
+    depends_on:
+      api:
+        condition: service_healthy
+    shm_size: "512m"
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: ../../infrastructure/docker/web/Dockerfile
+    image: black-mamba-web:dev
+    restart: unless-stopped
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:

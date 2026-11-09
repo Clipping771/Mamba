@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Case report — {{ r.case.title }}</title>
+<style>
+  @page {
+    size: A4;
+    margin: 18mm 16mm 22mm 16mm;
+    @bottom-left { content: "Prepared under the BLACK MAMBA Code · report {{ r.report_id }}"; font-size: 7.5pt; color: #555; }
+    @bottom-right { content: "Page " counter(page) " of " counter(pages); font-size: 7.5pt; color: #555; }
+  }
+  body { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 9.5pt; color: #111; line-height: 1.4; }
+  h1 { font-size: 17pt; margin: 0 0 2mm; }
+  h2 { font-size: 12pt; margin: 7mm 0 2mm; border-bottom: 1.5px solid #111; padding-bottom: 1mm; }
+  .meta { color: #444; font-size: 8.5pt; }
+  .banner { border: 1px solid #111; padding: 3mm; margin: 4mm 0; font-size: 8.5pt; background: #f3f3f3; }
+  table { width: 100%; border-collapse: collapse; margin-top: 2mm; }
+  th, td { border: 0.5px solid #888; padding: 1.2mm 1.5mm; text-align: left; vertical-align: top; }
+  th { background: #e8e8e8; font-size: 8pt; }
+  td { font-size: 8pt; }
+  .mono { font-family: "DejaVu Sans Mono", monospace; font-size: 7pt; word-break: break-all; }
+  .finding { border-left: 3px solid #111; padding: 1mm 0 1mm 3mm; margin: 3mm 0; page-break-inside: avoid; }
+  .finding .claim { font-size: 10pt; }
+  .muted { color: #666; }
+  .bad { color: #b00; font-weight: bold; }
+  .good { color: #060; font-weight: bold; }
+  dl { display: grid; grid-template-columns: 35mm auto; gap: 1mm 4mm; margin: 0; }
+  dt { font-weight: bold; } dd { margin: 0; }
+</style>
+</head>
+<body>
+  <p class="meta">{{ r.org_name }} · BLACK MAMBA evidence report</p>
+  <h1>{{ r.case.title }}</h1>
+  <dl>
+    <dt>Case ID</dt><dd class="mono">{{ r.case.id }}</dd>
+    <dt>Category</dt><dd>{{ r.case.category.value | replace("_", " ") }}</dd>
+    <dt>Status</dt><dd>{{ r.case.status.value }}</dd>
+    <dt>Case lead</dt><dd>{{ r.lead_name }}</dd>
+    <dt>Generated</dt><dd>{{ r.generated_at.strftime("%Y-%m-%d %H:%M:%S") }} UTC by {{ r.generated_by }}</dd>
+    <dt>Audit chain</dt>
+    <dd>{% if r.chain_ok %}<span class="good">intact</span>{% else %}<span class="bad">BROKEN — do not rely on this report</span>{% endif %} ({{ r.chain_entries }} entries verified)</dd>
+  </dl>
+
+  <div class="banner">
+    This report contains only findings that were verified by a reviewer other than their author.
+    Allegations are not proof: each finding is limited to what the cited evidence shows. Evidence
+    integrity can be checked by recomputing the SHA-256 of each item. Material was collected from
+    publicly available sources or supplied with consent.
+  </div>
+
+  <h2>Summary</h2>
+  <p>{{ r.case.description or "No description recorded." }}</p>
+
+  <h2>Verified findings ({{ r.findings | length }})</h2>
+  {% for f in r.findings %}
+  <div class="finding">
+    <div><strong>{{ f.ref }}.</strong> <span class="claim">{{ f.claim }}</span></div>
+    <div class="muted">
+      Evidence: {{ f.evidence_refs | join(", ") }} · Author: {{ f.author }} · Verified by {{ f.reviewer }}
+      on {{ f.reviewed_at.strftime("%Y-%m-%d %H:%M") }} UTC
+      {% if f.review_note %}<br>Review note: {{ f.review_note }}{% endif %}
+    </div>
+  </div>
+  {% else %}
+  <p class="muted">No verified findings.</p>
+  {% endfor %}
+
+  <h2>Evidence ({{ r.evidence | length }})</h2>
+  <table>
+    <thead><tr><th>Ref</th><th>Type / title</th><th>Source</th><th>Captured (UTC)</th><th>SHA-256</th></tr></thead>
+    <tbody>
+    {% for e in r.evidence %}
+      <tr>
+        <td>{{ e.ref }}</td>
+        <td>{{ e.type }}<br>{{ e.title }}{% if e.size %}<br><span class="muted">{{ e.mime }}, {{ e.size }} bytes</span>{% endif %}</td>
+        <td class="mono">{{ e.source_url or "—" }}{% if e.final_url %}<br>→ {{ e.final_url }}{% endif %}{% if e.http_status %}<br>HTTP {{ e.http_status }}{% endif %}</td>
+        <td>{{ e.captured_at.strftime("%Y-%m-%d %H:%M:%S") }}<br>by {{ e.captured_by }}</td>
+        <td class="mono">{{ e.sha256 or "n/a (reference only)" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if r.excluded %}
+  <p class="muted">Excluded and not relied upon:
+    {% for e in r.excluded %}{{ e.ref }} ({{ e.excluded_reason }}){% if not loop.last %}; {% endif %}{% endfor %}
+  </p>
+  {% endif %}
+
+  <h2>Chain of custody</h2>
+  <table>
+    <thead><tr><th>Time (UTC)</th><th>Action</th><th>Item</th><th>By</th><th>Detail</th><th>Entry hash</th></tr></thead>
+    <tbody>
+    {% for c in r.custody %}
+      <tr>
+        <td>{{ c.ts.strftime("%Y-%m-%d %H:%M:%S") }}</td>
+        <td>{{ c.action }}</td>
+        <td>{{ c.subject }}</td>
+        <td>{{ c.actor }}</td>
+        <td>{{ c.detail }}</td>
+        <td class="mono">{{ c.hash }}…</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <p class="meta" style="margin-top:8mm">
+    Prepared under the BLACK MAMBA Code: we do not confuse allegations with proof; we expose
+    wrongdoing through evidence; we never become what we were created to fight.
+    Software version {{ r.version }}.
+  </p>
+</body>
+</html>

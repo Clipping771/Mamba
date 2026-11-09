@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: API (ruff, mypy, pytest, security)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: apps/api
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: blackmamba
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: blackmamba_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U blackmamba -d blackmamba_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://blackmamba:ci-only-password@localhost:5432/blackmamba_test
+      REQUIRE_DB: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System libraries for WeasyPrint (PDF reports)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: apps/api/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Playwright Chromium (archiver tests)
+        run: uv run playwright install --with-deps chromium
+
+      - name: Ruff lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: Mypy (strict)
+        run: uv run mypy
+
+      - name: Pytest (coverage >= 80%)
+        run: uv run pytest --cov --cov-report=term --cov-report=xml
+
+      - name: Migrations are in sync with models
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+        run: uv run alembic upgrade head && uv run alembic check
+
+      - name: OpenAPI schema is up to date
+        run: |
+          uv run python scripts/export_openapi.py /tmp/openapi.json
+          diff -u openapi.json /tmp/openapi.json
+
+      - name: Bandit (static security analysis)
+        run: uv run bandit -q -r src -c pyproject.toml
+
+      - name: pip-audit (known vulnerable dependencies)
+        run: uv export --frozen --no-dev --no-hashes --no-emit-project -o /tmp/requirements.txt && uv run pip-audit -r /tmp/requirements.txt --strict
+
+  web:
+    name: Web (typecheck, lint, build)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Typed API client matches the API schema
+        run: pnpm gen:api && git diff --exit-code src/lib/api/schema.d.ts
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm build
+      - name: Audit production dependencies
+        run: pnpm audit --prod --audit-level high
+
+  secrets:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  e2e:
+    name: End-to-end (docker compose + Playwright)
+    runs-on: ubuntu-24.04
+    needs: [api, web]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate a throwaway .env
+        run: |
+          python3 - <<'PY'
+          import base64, pathlib, secrets
+          text = pathlib.Path(".env.example").read_text()
+          pg, mn = secrets.token_hex(16), secrets.token_hex(16)
+          text = (text.replace("SECRET_KEY=change-me-openssl-rand-hex-32", "SECRET_KEY=" + secrets.token_hex(32))
+                      .replace("FIELD_ENCRYPTION_KEY=change-me-fernet-key", "FIELD_ENCRYPTION_KEY=" + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
+                      .replace("change-me-postgres", pg).replace("change-me-minio-password", mn)
+                      .replace("MINIO_KMS_SECRET_KEY=change-me-name:base64-32-bytes", "MINIO_KMS_SECRET_KEY=ci-key:" + base64.b64encode(secrets.token_bytes(32)).decode()))
+          pathlib.Path(".env").write_text(text)
+          PY
+      - name: Start the stack
+        run: docker compose up -d --build --wait
+      - name: Seed demo data
+        run: docker compose exec -T -e BM_SEED_PASSWORD=e2e-demo-password-123 api blackmamba seed-demo
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - name: Run Playwright
+        working-directory: apps/web
+        env:
+          E2E_PASSWORD: e2e-demo-password-123
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+          pnpm test:e2e
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: apps/web/playwright-report

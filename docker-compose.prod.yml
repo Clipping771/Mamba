@@ -1,0 +1,189 @@
+# BLACK MAMBA — production stack for a single VPS. See docs/DEPLOYMENT.md.
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+# Only Caddy publishes ports (443). Data services sit on an internal network with no
+# internet access; the API and worker get outbound access for LLM/SMTP and archiving.
+
+name: black-mamba
+
+x-api-build: &api-build
+  context: ./apps/api
+  dockerfile: ../../infrastructure/docker/api/Dockerfile
+
+x-backend-env: &backend-env
+  APP_ENV: production
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  REDIS_URL: redis://redis:6379/0
+  S3_ENDPOINT_URL: http://minio:9000
+  STORAGE_BACKEND: s3
+  RATE_LIMIT_BACKEND: redis
+  ARCHIVE_ALLOW_PRIVATE_HOSTS: "false"
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "443:443/tcp"
+      - "443:443/udp" # HTTP/3
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+    volumes:
+      - ./infrastructure/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [edge]
+    depends_on: [web]
+    logging: *logging
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: ../../infrastructure/docker/web/Dockerfile
+    image: black-mamba-web:${RELEASE:-latest}
+    restart: unless-stopped
+    environment:
+      API_URL: http://api:8000
+    networks: [edge, app]
+    depends_on:
+      api:
+        condition: service_healthy
+    logging: *logging
+
+  api:
+    build:
+      <<: *api-build
+      target: api
+    image: black-mamba-api:${RELEASE:-latest}
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      <<: *backend-env
+      # Only Caddy -> web -> api can reach the API; trust their forwarded client IP.
+      FORWARDED_ALLOW_IPS: "*"
+    networks: [app, data, egress]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    logging: *logging
+
+  worker:
+    build:
+      <<: *api-build
+      target: worker
+    image: black-mamba-worker:${RELEASE:-latest}
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      <<: *backend-env
+    networks: [data, egress]
+    shm_size: "512m"
+    depends_on:
+      api:
+        condition: service_healthy
+    logging: *logging
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    logging: *logging
+
+  minio:
+    build:
+      context: ./infrastructure/docker/minio
+    image: black-mamba-minio:${RELEASE:-latest}
+    restart: unless-stopped
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      MINIO_KMS_SECRET_KEY: ${MINIO_KMS_SECRET_KEY:?set MINIO_KMS_SECRET_KEY}
+      MINIO_BROWSER: "off" # no web console in production
+    volumes:
+      - minio-data:/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  minio-init:
+    build:
+      context: ./infrastructure/docker/minio
+    image: black-mamba-minio:${RELEASE:-latest}
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-evidence}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/$${S3_BUCKET} &&
+      mc encrypt set sse-s3 local/$${S3_BUCKET} &&
+      mc anonymous set none local/$${S3_BUCKET}
+      "
+    networks: [data]
+    restart: "no"
+
+networks:
+  edge: {}
+  app:
+    internal: true
+  data:
+    internal: true
+  egress: {}
+
+volumes:
+  caddy-data:
+  caddy-config:
+  postgres-data:
+  redis-data:
+  minio-data:
